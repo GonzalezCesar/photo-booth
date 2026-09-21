@@ -1,0 +1,14 @@
+{
+  "name": "photo-booth",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @photobooth/web dev",
+    "dev:https": "pnpm --filter @photobooth/web dev:https",
+    "build": "pnpm --filter @photobooth/web build",
+    "lint": "pnpm -r lint",
+    "docker:build": "docker build -t photobooth .",
+    "docker:run": "docker run -p 3000:3000 photobooth"
+  },
+  "packageManager": "pnpm@10.32.1"
+}
