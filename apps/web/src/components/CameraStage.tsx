@@ -1,18 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { AVAILABLE_FILTERS, toCssFilter } from "@photobooth/core";
-import type { ImageFilter } from "@photobooth/core";
+import {
+  AVAILABLE_FILTERS,
+  AVAILABLE_FRAMES,
+  AVAILABLE_LAYOUTS,
+  toCssFilter,
+} from "@photobooth/core";
 import { useCamera } from "@/hooks/useCamera";
-
-interface CaptureResult {
-  ok: boolean;
-  filterId?: string | null;
-  fileName?: string;
-  bytes?: number;
-  printer?: string;
-  error?: string;
-}
+import { usePhotoSession } from "@/hooks/usePhotoSession";
+import { compose } from "@/lib/composition";
+import { ComingSoonModal } from "./ComingSoonModal";
 
 const subscribeToNothing = () => () => {};
 const getInsecureClient = () => !window.isSecureContext;
@@ -20,23 +18,36 @@ const getInsecureServer = () => false;
 
 export function CameraStage() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const offscreenRef = useRef<HTMLCanvasElement>(null);
   const [mode] = useState<"webcam" | "mock">(() =>
     typeof window !== "undefined" &&
     new URLSearchParams(window.location.search).get("camera") === "mock"
       ? "mock"
       : "webcam",
   );
-  const [selectedFilter, setSelectedFilter] = useState<ImageFilter>(
-    AVAILABLE_FILTERS[0],
-  );
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<CaptureResult | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [showPrintModal, setShowPrintModal] = useState(false);
   const insecure = useSyncExternalStore(
     subscribeToNothing,
     getInsecureClient,
     getInsecureServer,
   );
+
+  const {
+    selectedFilter,
+    setSelectedFilter,
+    selectedFrame,
+    setSelectedFrame,
+    selectedLayout,
+    setSelectedLayout,
+    capturedPhotos,
+    addPhoto,
+    canCapture,
+    isComplete,
+    resetSession,
+  } = usePhotoSession();
+
   const { stream, status, error, start, stop, isReady } = useCamera(mode);
 
   useEffect(() => {
@@ -49,10 +60,10 @@ export function CameraStage() {
 
   const capture = useCallback(async () => {
     const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
+    const canvas = offscreenRef.current;
+    if (!video || !canvas || !canCapture) return;
+
     setBusy(true);
-    setResult(null);
     try {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -60,22 +71,52 @@ export function CameraStage() {
       if (!ctx) throw new Error("canvas 2d unavailable");
       ctx.filter = toCssFilter(selectedFilter.config);
       ctx.drawImage(video, 0, 0);
+
       const blob = await new Promise<Blob | null>((resolve) =>
         canvas.toBlob(resolve, "image/jpeg", 0.92),
       );
-      if (!blob) throw new Error("frame capture failed");
-      const form = new FormData();
-      form.append("photo", blob, "photo.jpg");
-      form.append("filterId", selectedFilter.id);
-      const res = await fetch("/api/print", { method: "POST", body: form });
-      const data = (await res.json()) as CaptureResult;
-      setResult(data);
+      if (!blob) throw new Error("capture failed");
+
+      addPhoto(blob);
     } catch (err) {
-      setResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      console.error("capture error:", err);
     } finally {
       setBusy(false);
     }
-  }, [selectedFilter]);
+  }, [selectedFilter, canCapture, addPhoto]);
+
+  const handleDownload = useCallback(async () => {
+    if (capturedPhotos.length === 0) return;
+    setDownloading(true);
+    try {
+      const bitmaps = await Promise.all(
+        capturedPhotos.map((p) => createImageBitmap(p.blob)),
+      );
+      const result = await compose({
+        photos: bitmaps,
+        frame: selectedFrame.id === "none" ? null : selectedFrame,
+        layout: selectedLayout,
+      });
+      const blob = await result.toBlob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `photo-booth-${selectedLayout.id}.jpg`;
+      a.click();
+      URL.revokeObjectURL(url);
+      resetSession();
+    } catch (err) {
+      console.error("download error:", err);
+    } finally {
+      setDownloading(false);
+    }
+  }, [capturedPhotos, selectedFrame, selectedLayout, resetSession]);
+
+  const captureLabel = isComplete
+    ? "¡Listo!"
+    : busy
+      ? "Capturando…"
+      : `Capturar (${capturedPhotos.length + 1}/${selectedLayout.photoRegions.length})`;
 
   return (
     <div className="flex flex-1 flex-col bg-black">
@@ -96,6 +137,7 @@ export function CameraStage() {
           )}
         </header>
 
+        {/* Camera preview */}
         <section className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-950">
           <div className="relative aspect-[4/3] w-full bg-zinc-950">
             {isReady ? (
@@ -116,7 +158,7 @@ export function CameraStage() {
                     </p>
                     <p className="text-sm">
                       El navegador solo expone la cámara en HTTPS con un
-                      certificado de confianza. Abre esta página por HTTPS e
+                      certificado de confianza. Abre la página por HTTPS o
                       instala la CA de desarrollo en el dispositivo.
                     </p>
                   </div>
@@ -147,6 +189,39 @@ export function CameraStage() {
           </div>
         </section>
 
+        {/* Layout selector */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-medium uppercase tracking-widest text-zinc-500">
+            Layout
+          </h2>
+          <ul className="grid grid-cols-3 gap-3">
+            {AVAILABLE_LAYOUTS.map((layout) => {
+              const active = layout.id === selectedLayout.id;
+              return (
+                <li key={layout.id}>
+                  <button
+                    onClick={() => setSelectedLayout(layout)}
+                    disabled={capturedPhotos.length > 0}
+                    className={`w-full rounded-xl border px-3 py-3 text-left transition ${
+                      active
+                        ? "border-white bg-zinc-800"
+                        : "border-white/10 bg-zinc-900 hover:border-white/40"
+                    } disabled:opacity-40 disabled:cursor-not-allowed`}
+                  >
+                    <p className={`text-sm font-medium ${active ? "text-white" : "text-zinc-300"}`}>
+                      {layout.name}
+                    </p>
+                    <p className="mt-0.5 text-xs text-zinc-500">
+                      {layout.photoRegions.length} foto{layout.photoRegions.length > 1 ? "s" : ""} · {layout.width}×{layout.height}
+                    </p>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+
+        {/* Filter selector */}
         <section className="space-y-3">
           <h2 className="text-sm font-medium uppercase tracking-widest text-zinc-500">
             Filtro
@@ -182,32 +257,105 @@ export function CameraStage() {
           </ul>
         </section>
 
-        <div className="flex items-center gap-4">
+        {/* Frame selector */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-medium uppercase tracking-widest text-zinc-500">
+            Marco
+          </h2>
+          <ul className="grid grid-cols-3 gap-3">
+            {AVAILABLE_FRAMES.map((frame) => {
+              const active = frame.id === selectedFrame.id;
+              return (
+                <li key={frame.id}>
+                  <button
+                    onClick={() => setSelectedFrame(frame)}
+                    className={`w-full rounded-xl border px-3 py-3 text-left transition ${
+                      active
+                        ? "border-white bg-zinc-800"
+                        : "border-white/10 bg-zinc-900 hover:border-white/40"
+                    }`}
+                  >
+                    <p className={`text-sm font-medium ${active ? "text-white" : "text-zinc-300"}`}>
+                      {frame.name}
+                    </p>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+
+        {/* Capture progress */}
+        {capturedPhotos.length > 0 && (
+          <section className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-medium uppercase tracking-widest text-zinc-500">
+                Capturas ({capturedPhotos.length}/{selectedLayout.photoRegions.length})
+              </h2>
+              <button
+                onClick={resetSession}
+                className="text-xs text-zinc-500 underline transition hover:text-zinc-300"
+              >
+                Limpiar
+              </button>
+            </div>
+            <div className="flex gap-2">
+              {capturedPhotos.map((photo, i) => (
+                <div
+                  key={`capture-${i}`}
+                  className="relative h-16 flex-1 overflow-hidden rounded-lg border border-white/10"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={photo.url}
+                    alt={`Captura ${i + 1}`}
+                    className="h-full w-full object-cover"
+                  />
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-3">
           <button
             onClick={() => void capture()}
-            disabled={!isReady || busy}
+            disabled={!isReady || busy || !canCapture}
             className="flex-1 rounded-full bg-white px-6 py-3 font-medium text-black transition enabled:hover:bg-zinc-200 disabled:opacity-40"
           >
-            {busy ? "Procesando…" : "Capturar y enviar a impresión"}
+            {captureLabel}
           </button>
+
+          <button
+            onClick={() => void handleDownload()}
+            disabled={!isComplete || downloading}
+            className="rounded-full border border-white/15 px-6 py-3 text-sm font-medium text-zinc-300 transition hover:border-white/40 disabled:opacity-40"
+          >
+            {downloading ? "Descargando…" : "Descargar"}
+          </button>
+
+          <button
+            onClick={() => setShowPrintModal(true)}
+            className="rounded-full border border-white/15 px-6 py-3 text-sm font-medium text-zinc-500 transition hover:border-white/40 hover:text-zinc-300"
+          >
+            Imprimir
+          </button>
+
           {isReady && (
             <button
               onClick={() => stop()}
-              className="rounded-full border border-white/15 px-6 py-3 text-sm font-medium text-zinc-300 transition hover:border-white/40"
+              className="rounded-full border border-white/15 px-4 py-3 text-sm font-medium text-zinc-300 transition hover:border-white/40"
             >
               Apagar
             </button>
           )}
         </div>
 
-        {result && (
-          <pre className="overflow-x-auto rounded-xl border border-white/10 bg-zinc-950 px-4 py-3 font-mono text-xs text-zinc-300">
-            {JSON.stringify(result, null, 2)}
-          </pre>
-        )}
-
-        <canvas ref={canvasRef} className="hidden" />
+        <canvas ref={offscreenRef} className="hidden" />
       </main>
+
+      <ComingSoonModal open={showPrintModal} onClose={() => setShowPrintModal(false)} />
     </div>
   );
 }
